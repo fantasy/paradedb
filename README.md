@@ -27,6 +27,8 @@
 
 [ParadeDB](https://paradedb.com) is a modern Elasticsearch alternative built on Postgres. Built for real-time, update-heavy workloads.
 
+> **Note:** This fork removes the enterprise standby node restrictions.
+
 ## Get Started
 
 Please see our [documentation](https://docs.paradedb.com) to get started. You'll also find our [architecture](https://docs.paradedb.com/welcome/architecture)
