@@ -719,16 +719,11 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
         |result| !result.is_empty(),
     );
 
-    // Test that the correct error is returned when trying to read from a standby
-    let result = "SELECT id FROM items WHERE items @@@ 'category:Electronics' ORDER BY id"
-        .fetch_result::<(i32,)>(&mut standby_conn);
-
-    match result {
-        Err(err) => assert!(err.to_string().contains("Serving reads from a standby requires write-ahead log (WAL) integration, which is supported on ParadeDB Enterprise, not ParadeDB Community")),
-        _ => {
-            panic!("physical replication should not be supported on ParadeDB Community {:?}", result);
-        }
-    }
+    // Verify searching on the standby works.
+    let standby_results: Vec<(i32,)> =
+        "SELECT id FROM items WHERE items @@@ 'category:Electronics' ORDER BY id"
+            .fetch(&mut standby_conn);
+    assert_eq!(standby_results, vec![(3,), (4,)]);
 
     Ok(())
 }
