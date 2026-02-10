@@ -102,6 +102,10 @@ impl EphemeralPostgres {
         Self::pg_bin_path().join("pg_basebackup")
     }
 
+    fn pg_waldump_path() -> PathBuf {
+        Self::pg_bin_path().join("pg_waldump")
+    }
+
     fn initdb_path() -> PathBuf {
         Self::pg_bin_path().join("initdb")
     }
@@ -724,6 +728,528 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
         "SELECT id FROM items WHERE items @@@ 'category:Electronics' ORDER BY id"
             .fetch(&mut standby_conn);
     assert_eq!(standby_results, vec![(3,), (4,)]);
+
+    Ok(())
+}
+
+#[rstest]
+async fn test_physical_streaming_replication_replays_bm25_index_wal() -> Result<()> {
+    let primary_config = "
+        listen_addresses = 'localhost'
+        wal_level = replica
+        max_wal_senders = 4
+        shared_preload_libraries = 'pg_search'
+    ";
+
+    let primary_pg_hba = "
+        host replication replicator 127.0.0.1/32 md5
+        host replication replicator ::1/128 md5
+    ";
+
+    let primary_postgres = EphemeralPostgres::new(Some(primary_config), Some(primary_pg_hba));
+    let mut primary_conn = primary_postgres.connection().await?;
+
+    "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'replicator_pass';"
+        .execute(&mut primary_conn);
+    "CREATE EXTENSION pg_search".execute(&mut primary_conn);
+    "CREATE TABLE replicated_items (id SERIAL PRIMARY KEY, info TEXT)".execute(&mut primary_conn);
+    "CREATE INDEX replicated_items_idx ON replicated_items
+        USING bm25 (id, info) WITH (key_field = 'id')"
+        .execute(&mut primary_conn);
+
+    "INSERT INTO replicated_items (info) VALUES ('initial marker')".execute(&mut primary_conn);
+
+    let primary_port = primary_postgres.port;
+
+    let standby_tempdir = TempDir::new().expect("Failed to create temp dir for standby");
+    std::fs::set_permissions(
+        standby_tempdir.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+
+    let pg_basebackup = EphemeralPostgres::pg_basebackup_path();
+    let standby_tempdir = standby_tempdir.path();
+    run_cmd!(
+        $pg_basebackup
+        -D $standby_tempdir
+        -Fp -Xs -P -R
+        -h localhost
+        -U replicator
+        --port $primary_port
+        &> /dev/null
+    )
+    .expect("Failed to run pg_basebackup for standby setup");
+
+    let standby_config = "
+        shared_preload_libraries = 'pg_search'
+        hot_standby = on
+    ";
+
+    let standby_postgres =
+        EphemeralPostgres::new_from_initialized(standby_tempdir, Some(standby_config), None);
+    let mut standby_conn = standby_postgres.connection().await?;
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let initial_search: Vec<(i32,)> =
+        "SELECT id FROM replicated_items WHERE replicated_items @@@ 'info:initial' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(1,)]);
+    assert_eq!(initial_search, vec![(1,)]);
+
+    "INSERT INTO replicated_items (info) VALUES ('streamed wal marker')".execute(&mut primary_conn);
+
+    let replicated_heap_row: Vec<(i32,)> =
+        "SELECT id FROM replicated_items WHERE info = 'streamed wal marker' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(2,)]);
+    assert_eq!(replicated_heap_row, vec![(2,)]);
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let replicated_search_row: Vec<(i32,)> =
+        "SELECT id FROM replicated_items WHERE replicated_items @@@ 'info:marker' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| {
+                result == &[(1,), (2,)]
+            });
+    assert_eq!(replicated_search_row, vec![(1,), (2,)]);
+
+    Ok(())
+}
+
+#[rstest]
+async fn test_physical_streaming_replication_replays_bm25_update_delete_copy() -> Result<()> {
+    let primary_config = "
+        listen_addresses = 'localhost'
+        wal_level = replica
+        max_wal_senders = 4
+        shared_preload_libraries = 'pg_search'
+    ";
+
+    let primary_pg_hba = "
+        host replication replicator 127.0.0.1/32 md5
+        host replication replicator ::1/128 md5
+    ";
+
+    let primary_postgres = EphemeralPostgres::new(Some(primary_config), Some(primary_pg_hba));
+    let mut primary_conn = primary_postgres.connection().await?;
+
+    "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'replicator_pass';"
+        .execute(&mut primary_conn);
+    "CREATE EXTENSION pg_search".execute(&mut primary_conn);
+    "CREATE TABLE replicated_udc (id SERIAL PRIMARY KEY, info TEXT)".execute(&mut primary_conn);
+    "CREATE INDEX replicated_udc_idx ON replicated_udc
+        USING bm25 (id, info) WITH (key_field = 'id')"
+        .execute(&mut primary_conn);
+
+    "INSERT INTO replicated_udc (info) VALUES
+        ('alpha running shoes'),
+        ('beta wireless headphones'),
+        ('gamma winter jacket')"
+        .execute(&mut primary_conn);
+
+    let primary_port = primary_postgres.port;
+
+    let standby_tempdir = TempDir::new().expect("Failed to create temp dir for standby");
+    std::fs::set_permissions(
+        standby_tempdir.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+
+    let pg_basebackup = EphemeralPostgres::pg_basebackup_path();
+    let standby_tempdir = standby_tempdir.path();
+    run_cmd!(
+        $pg_basebackup
+        -D $standby_tempdir
+        -Fp -Xs -P -R
+        -h localhost
+        -U replicator
+        --port $primary_port
+        &> /dev/null
+    )
+    .expect("Failed to run pg_basebackup for standby setup");
+
+    let standby_config = "
+        shared_preload_libraries = 'pg_search'
+        hot_standby = on
+    ";
+
+    let standby_postgres =
+        EphemeralPostgres::new_from_initialized(standby_tempdir, Some(standby_config), None);
+    let mut standby_conn = standby_postgres.connection().await?;
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let initial_search: Vec<(i32,)> =
+        "SELECT id FROM replicated_udc WHERE replicated_udc @@@ 'info:shoes' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(1,)]);
+    assert_eq!(initial_search, vec![(1,)]);
+
+    "UPDATE replicated_udc SET info = 'alpha trail boots' WHERE id = 1".execute(&mut primary_conn);
+
+    let updated_heap_row: Vec<(String,)> = "SELECT info FROM replicated_udc WHERE id = 1"
+        .fetch_retry(&mut standby_conn, 60, 1000, |result| {
+            result == &[("alpha trail boots".to_string(),)]
+        });
+    assert_eq!(updated_heap_row, vec![("alpha trail boots".to_string(),)]);
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let updated_search_row: Vec<(i32,)> =
+        "SELECT id FROM replicated_udc WHERE replicated_udc @@@ 'info:boots' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(1,)]);
+    assert_eq!(updated_search_row, vec![(1,)]);
+
+    let removed_old_term: Vec<(i32,)> =
+        "SELECT id FROM replicated_udc WHERE replicated_udc @@@ 'info:shoes' ORDER BY id"
+            .fetch(&mut standby_conn);
+    assert!(removed_old_term.is_empty());
+
+    "DELETE FROM replicated_udc WHERE id = 2".execute(&mut primary_conn);
+
+    let deleted_heap_count: Vec<(i64,)> = "SELECT COUNT(*) FROM replicated_udc WHERE id = 2"
+        .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(0,)]);
+    assert_eq!(deleted_heap_count, vec![(0,)]);
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let deleted_search_rows: Vec<(i32,)> =
+        "SELECT id FROM replicated_udc WHERE replicated_udc @@@ 'info:headphones' ORDER BY id"
+            .fetch(&mut standby_conn);
+    assert!(deleted_search_rows.is_empty());
+
+    let mut copyin = primary_conn
+        .copy_in_raw("COPY replicated_udc(info) FROM STDIN")
+        .await?;
+    copyin
+        .send("copied marker one\ncopied marker two".as_bytes())
+        .await?;
+    copyin.finish().await?;
+
+    let copied_heap_rows: Vec<(i64,)> =
+        "SELECT COUNT(*) FROM replicated_udc WHERE info LIKE 'copied marker %'".fetch_retry(
+            &mut standby_conn,
+            60,
+            1000,
+            |result| result == &[(2,)],
+        );
+    assert_eq!(copied_heap_rows, vec![(2,)]);
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let copied_search_rows: Vec<(i32,)> =
+        "SELECT id FROM replicated_udc WHERE replicated_udc @@@ 'info:copied' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| {
+                result == &[(4,), (5,)]
+            });
+    assert_eq!(copied_search_rows, vec![(4,), (5,)]);
+
+    Ok(())
+}
+
+#[rstest]
+async fn test_physical_streaming_replication_replays_bm25_vacuum_and_reindex() -> Result<()> {
+    let primary_config = "
+        listen_addresses = 'localhost'
+        wal_level = replica
+        max_wal_senders = 4
+        shared_preload_libraries = 'pg_search'
+    ";
+
+    let primary_pg_hba = "
+        host replication replicator 127.0.0.1/32 md5
+        host replication replicator ::1/128 md5
+    ";
+
+    let primary_postgres = EphemeralPostgres::new(Some(primary_config), Some(primary_pg_hba));
+    let mut primary_conn = primary_postgres.connection().await?;
+
+    "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'replicator_pass';"
+        .execute(&mut primary_conn);
+    "CREATE EXTENSION pg_search".execute(&mut primary_conn);
+    "CREATE TABLE replicated_maintenance (id SERIAL PRIMARY KEY, info TEXT)"
+        .execute(&mut primary_conn);
+    "CREATE INDEX replicated_maintenance_idx ON replicated_maintenance
+        USING bm25 (id, info) WITH (key_field = 'id')"
+        .execute(&mut primary_conn);
+
+    "INSERT INTO replicated_maintenance (info)
+        SELECT CASE
+            WHEN g % 2 = 0 THEN 'drop marker ' || g::text
+            ELSE 'keep marker ' || g::text
+        END
+        FROM generate_series(1, 200) AS g"
+        .execute(&mut primary_conn);
+
+    let primary_port = primary_postgres.port;
+
+    let standby_tempdir = TempDir::new().expect("Failed to create temp dir for standby");
+    std::fs::set_permissions(
+        standby_tempdir.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+
+    let pg_basebackup = EphemeralPostgres::pg_basebackup_path();
+    let standby_tempdir = standby_tempdir.path();
+    run_cmd!(
+        $pg_basebackup
+        -D $standby_tempdir
+        -Fp -Xs -P -R
+        -h localhost
+        -U replicator
+        --port $primary_port
+        &> /dev/null
+    )
+    .expect("Failed to run pg_basebackup for standby setup");
+
+    let standby_config = "
+        shared_preload_libraries = 'pg_search'
+        hot_standby = on
+    ";
+
+    let standby_postgres =
+        EphemeralPostgres::new_from_initialized(standby_tempdir, Some(standby_config), None);
+    let mut standby_conn = standby_postgres.connection().await?;
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let initial_keep_count: Vec<(i64,)> =
+        "SELECT COUNT(*) FROM replicated_maintenance WHERE replicated_maintenance @@@ 'info:keep'"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(100,)]);
+    assert_eq!(initial_keep_count, vec![(100,)]);
+
+    "DELETE FROM replicated_maintenance WHERE info LIKE 'drop marker %'".execute(&mut primary_conn);
+    "VACUUM replicated_maintenance".execute(&mut primary_conn);
+    "REINDEX INDEX replicated_maintenance_idx".execute(&mut primary_conn);
+
+    let replicated_rows_after_delete: Vec<(i64,)> = "SELECT COUNT(*) FROM replicated_maintenance"
+        .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(100,)]);
+    assert_eq!(replicated_rows_after_delete, vec![(100,)]);
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let keep_count_after_maintenance: Vec<(i64,)> =
+        "SELECT COUNT(*) FROM replicated_maintenance WHERE replicated_maintenance @@@ 'info:keep'"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(100,)]);
+    assert_eq!(keep_count_after_maintenance, vec![(100,)]);
+
+    let drop_count_after_maintenance: Vec<(i64,)> =
+        "SELECT COUNT(*) FROM replicated_maintenance WHERE replicated_maintenance @@@ 'info:drop'"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(0,)]);
+    assert_eq!(drop_count_after_maintenance, vec![(0,)]);
+
+    Ok(())
+}
+
+#[rstest]
+async fn test_physical_streaming_failover_promote_keeps_bm25_read_write() -> Result<()> {
+    let primary_config = "
+        listen_addresses = 'localhost'
+        wal_level = replica
+        max_wal_senders = 4
+        shared_preload_libraries = 'pg_search'
+    ";
+
+    let primary_pg_hba = "
+        host replication replicator 127.0.0.1/32 md5
+        host replication replicator ::1/128 md5
+    ";
+
+    let primary_postgres = EphemeralPostgres::new(Some(primary_config), Some(primary_pg_hba));
+    let mut primary_conn = primary_postgres.connection().await?;
+
+    "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'replicator_pass';"
+        .execute(&mut primary_conn);
+    "CREATE EXTENSION pg_search".execute(&mut primary_conn);
+    "CREATE TABLE failover_items (id SERIAL PRIMARY KEY, info TEXT)".execute(&mut primary_conn);
+    "CREATE INDEX failover_items_idx ON failover_items
+        USING bm25 (id, info) WITH (key_field = 'id')"
+        .execute(&mut primary_conn);
+    "INSERT INTO failover_items (info) VALUES ('before failover marker')"
+        .execute(&mut primary_conn);
+
+    let primary_port = primary_postgres.port;
+
+    let standby_tempdir = TempDir::new().expect("Failed to create temp dir for standby");
+    std::fs::set_permissions(
+        standby_tempdir.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+
+    let pg_basebackup = EphemeralPostgres::pg_basebackup_path();
+    let standby_tempdir = standby_tempdir.path();
+    run_cmd!(
+        $pg_basebackup
+        -D $standby_tempdir
+        -Fp -Xs -P -R
+        -h localhost
+        -U replicator
+        --port $primary_port
+        &> /dev/null
+    )
+    .expect("Failed to run pg_basebackup for standby setup");
+
+    let standby_config = "
+        shared_preload_libraries = 'pg_search'
+        hot_standby = on
+    ";
+
+    let standby_postgres =
+        EphemeralPostgres::new_from_initialized(standby_tempdir, Some(standby_config), None);
+    let mut standby_conn = standby_postgres.connection().await?;
+
+    "SET enable_seqscan = off".execute(&mut standby_conn);
+    let before_promote_rows: Vec<(i32,)> =
+        "SELECT id FROM failover_items WHERE failover_items @@@ 'info:before' ORDER BY id"
+            .fetch_retry(&mut standby_conn, 60, 1000, |result| result == &[(1,)]);
+    assert_eq!(before_promote_rows, vec![(1,)]);
+
+    let pg_ctl_path = primary_postgres.pg_ctl_path.clone();
+    let tempdir_path = primary_postgres.tempdir_path.clone();
+    run_cmd!($pg_ctl_path -D $tempdir_path stop &> /dev/null).expect("failed to stop primary");
+
+    let pg_ctl_path = standby_postgres.pg_ctl_path.clone();
+    let tempdir_path = standby_postgres.tempdir_path.clone();
+    run_cmd!($pg_ctl_path -D $tempdir_path promote &> /dev/null)
+        .expect("Failed to promote standby");
+
+    thread::sleep(Duration::from_secs(2));
+
+    let mut promoted_conn = standby_postgres.connection().await?;
+    "SET enable_seqscan = off".execute(&mut promoted_conn);
+
+    let after_promote_rows: Vec<(i32,)> =
+        "SELECT id FROM failover_items WHERE failover_items @@@ 'info:before' ORDER BY id"
+            .fetch_retry(&mut promoted_conn, 60, 1000, |result| result == &[(1,)]);
+    assert_eq!(after_promote_rows, vec![(1,)]);
+
+    "INSERT INTO failover_items (info) VALUES ('after promote marker')".execute(&mut promoted_conn);
+
+    let after_write_rows: Vec<(i32,)> =
+        "SELECT id FROM failover_items WHERE failover_items @@@ 'info:marker' ORDER BY id"
+            .fetch_retry(&mut promoted_conn, 60, 1000, |result| {
+                result == &[(1,), (2,)]
+            });
+    assert_eq!(after_write_rows, vec![(1,), (2,)]);
+
+    Ok(())
+}
+
+#[rstest]
+async fn test_generic_wal_is_emitted_for_bm25_writes() -> Result<()> {
+    let config = "
+        wal_level = replica
+        max_wal_senders = 4
+        shared_preload_libraries = 'pg_search'
+    ";
+
+    let postgres = EphemeralPostgres::new(Some(config), None);
+    let mut conn = postgres.connection().await?;
+
+    "CREATE EXTENSION pg_search".execute(&mut conn);
+    "CREATE TABLE wal_generic_items (
+        id SERIAL PRIMARY KEY,
+        description TEXT
+    )"
+    .execute(&mut conn);
+    "CREATE INDEX wal_generic_items_idx ON wal_generic_items
+        USING bm25 (id, description) WITH (key_field = 'id')"
+        .execute(&mut conn);
+
+    "CHECKPOINT".execute(&mut conn);
+    let start_lsn: String = "SELECT pg_current_wal_lsn()::text"
+        .fetch_one::<(String,)>(&mut conn)
+        .0;
+
+    "INSERT INTO wal_generic_items (description)
+        SELECT 'generic wal marker ' || g
+        FROM generate_series(1, 200) AS g"
+        .execute(&mut conn);
+    "SELECT pg_switch_wal()".execute(&mut conn);
+    let end_lsn: String = "SELECT pg_current_wal_lsn()::text"
+        .fetch_one::<(String,)>(&mut conn)
+        .0;
+
+    let relfilenode: String =
+        "SELECT pg_relation_filenode('wal_generic_items_idx'::regclass)::text"
+            .fetch_one::<(String,)>(&mut conn)
+            .0;
+
+    let pg_waldump = EphemeralPostgres::pg_waldump_path();
+    let wal_dir = Path::new(&postgres.tempdir_path).join("pg_wal");
+    let wal_dir = wal_dir
+        .to_str()
+        .expect("pg_wal path should be valid UTF-8")
+        .to_string();
+
+    let output = run_fun!($pg_waldump -p $wal_dir -s $start_lsn -e $end_lsn -r Generic)
+        .expect("pg_waldump should succeed");
+    assert!(
+        output.contains("rmgr: Generic"),
+        "expected generic WAL records, got:\n{output}"
+    );
+    assert!(
+        output.contains(&relfilenode),
+        "expected relfilenode {} in generic WAL output, got:\n{output}",
+        relfilenode
+    );
+
+    Ok(())
+}
+
+#[rstest]
+async fn test_crash_recovery_replays_bm25_index_wal() -> Result<()> {
+    let config = "
+        wal_level = replica
+        max_wal_senders = 4
+        shared_preload_libraries = 'pg_search'
+    ";
+
+    let postgres = EphemeralPostgres::new(Some(config), None);
+    let mut conn = postgres.connection().await?;
+
+    "CREATE EXTENSION pg_search".execute(&mut conn);
+    "CREATE TABLE crash_recovery_items (
+        id SERIAL PRIMARY KEY,
+        description TEXT
+    )"
+    .execute(&mut conn);
+    "CREATE INDEX crash_recovery_items_idx ON crash_recovery_items
+        USING bm25 (id, description) WITH (key_field = 'id')"
+        .execute(&mut conn);
+
+    "INSERT INTO crash_recovery_items (description)
+        SELECT 'recoverable marker ' || g
+        FROM generate_series(1, 1000) AS g"
+        .execute(&mut conn);
+
+    "SET enable_seqscan = off".execute(&mut conn);
+    let before_crash: (i64,) =
+        "SELECT COUNT(*) FROM crash_recovery_items WHERE crash_recovery_items @@@ 'description:marker'"
+            .fetch_one(&mut conn);
+    assert_eq!(before_crash.0, 1000);
+
+    drop(conn);
+
+    let postmaster_pid_path = Path::new(&postgres.tempdir_path).join("postmaster.pid");
+    let postmaster_pid: i32 = std::fs::read_to_string(&postmaster_pid_path)
+        .expect("postmaster.pid should exist")
+        .lines()
+        .next()
+        .expect("postmaster.pid should contain a PID")
+        .parse()
+        .expect("postmaster PID should be numeric");
+    run_cmd!(kill -9 $postmaster_pid).expect("kill -9 should terminate primary");
+
+    thread::sleep(Duration::from_secs(1));
+
+    let restart_log = format!(
+        "/tmp/ephemeral_postgres_logs/restart-{}.log",
+        chrono::Utc::now().timestamp_millis()
+    );
+    let pg_ctl_path = postgres.pg_ctl_path.clone();
+    let tempdir_path = postgres.tempdir_path.clone();
+    run_cmd!($pg_ctl_path -D $tempdir_path -l $restart_log start &> /dev/null)
+        .expect("failed to restart postgres after crash");
+
+    let mut conn = postgres.connection().await?;
+    "SET enable_seqscan = off".execute(&mut conn);
+    let after_crash: Vec<(i64,)> =
+        "SELECT COUNT(*) FROM crash_recovery_items WHERE crash_recovery_items @@@ 'description:marker'"
+            .fetch_retry(&mut conn, 60, 1000, |result| !result.is_empty());
+
+    assert_eq!(after_crash.len(), 1);
+    assert_eq!(after_crash[0].0, 1000);
 
     Ok(())
 }
