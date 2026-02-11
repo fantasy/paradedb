@@ -15,15 +15,44 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-//! Execution state and plan building for JoinScan custom scan.
+//! # Parallel Partitioning Strategy & Correctness
 //!
-//! This module defines the runtime state of the custom scan, including the DataFusion
-//! execution context. It also contains the logic for building the DataFusion logical plan
-//! from the serialized planning data.
+//! `JoinScan` implements parallel execution by **partitioning the first (outermost) table**
+//! across workers while **replicating (fully scanning)** all subsequent tables in the join tree.
+//!
+//! This is equivalent to a "Broadcast Join" or "Fragment-and-Replicate" strategy in distributed
+//! databases.
+//!
+//! ## Correctness
+//!
+//! This strategy relies on the distributive property of Inner Joins:
+//!
+//! (A_part1 JOIN B) UNION (A_part2 JOIN B) = (A_part1 UNION A_part2) JOIN B = A JOIN B
+//!
+//! Each worker computes a partial join result for its subset of `A`. When these partial results
+//! are gathered by PostgreSQL, the union forms the complete, correct result set.
+//!
+//! ## SAFETY WARNING
+//!
+//! This strategy is **ONLY CORRECT** for:
+//! 1.  **Inner Joins**: `JOIN_INNER`
+//! 2.  **Left Outer Joins** (where the Left/Outer table is partitioned)
+//! 3.  **Semi Joins** (where the Left table is partitioned)
+//! 4.  **Anti Joins** (where the Left table is partitioned)
+//!
+//! It is **INCORRECT** and will produce duplicate or wrong results for:
+//! 1.  **Right Outer Joins**: Unmatched rows from the replicated Right table would be emitted
+//!     as `(NULL, b)` by *every* worker, causing duplicates.
+//! 2.  **Full Outer Joins**: Same duplicate issue for the replicated side.
+//! 3.  **Aggregations**: If DataFusion were performing global aggregations (e.g. `COUNT`),
+//!     each worker would emit a partial count, and PostgreSQL's `Gather` would treat them as
+//!     distinct rows rather than summing them.
+//!
+//! **Before enabling any JoinType other than `JOIN_INNER`, you must verify that the partitioning
+//! logic in `build_clause_df` respects these constraints.**
 
 use std::sync::Arc;
 
-use arrow_array::UInt64Array;
 use datafusion::common::{DataFusionError, JoinType, Result};
 use datafusion::logical_expr::{col, Expr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -33,22 +62,17 @@ use futures::future::{FutureExt, LocalBoxFuture};
 use pgrx::pg_sys;
 
 use crate::api::{OrderByFeature, SortDirection};
-use crate::index::fast_fields_helper::{FFHelper, WhichFastField};
-use crate::index::mvcc::MvccSatisfies;
-use crate::index::reader::index::SearchIndexReader;
-use crate::postgres::customscan::joinscan::build::{
-    JoinCSClause, JoinLevelSearchPredicate, JoinSource,
-};
-
+use crate::index::fast_fields_helper::WhichFastField;
+use crate::postgres::customscan::joinscan::build::{JoinCSClause, JoinSource};
 use crate::postgres::customscan::joinscan::privdat::{
     OutputColumnInfo, PrivateData, SCORE_COL_NAME,
 };
 use crate::postgres::customscan::joinscan::translator::{make_col, CombinedMapper};
 use crate::postgres::customscan::CustomScanState;
 use crate::postgres::heap::VisibilityChecker;
-use crate::postgres::heap::VisibilityChecker as HeapVisibilityChecker;
 use crate::postgres::rel::PgSearchRelation;
-use crate::scan::{PgSearchTableProvider, Scanner};
+use crate::postgres::ParallelScanState;
+use crate::scan::PgSearchTableProvider;
 
 /// Execution state for a single base relation in a join.
 pub struct RelationState {
@@ -70,7 +94,6 @@ pub struct JoinScanState {
     /// Map of range table index (RTI) to relation execution state.
     pub relations: crate::api::HashMap<pg_sys::Index, RelationState>,
 
-    // === Result state ===
     /// Result tuple slot.
     pub result_slot: Option<*mut pg_sys::TupleTableSlot>,
 
@@ -80,18 +103,21 @@ pub struct JoinScanState {
     pub current_batch: Option<arrow_array::RecordBatch>,
     pub batch_index: usize,
 
-    // === Output column mapping ===
     /// Mapping of output column positions to their source (outer/inner) and original attribute numbers.
     /// Populated from PrivateData during create_custom_scan_state.
     pub output_columns: Vec<OutputColumnInfo>,
 
-    // === Memory tracking ===
     /// Maximum allowed memory for execution (from work_mem, in bytes).
     pub max_memory: usize,
 
-    // === Serialized Plan ===
     /// Serialized DataFusion LogicalPlan from planning phase.
     pub logical_plan: Option<bytes::Bytes>,
+
+    /// Shared state for parallel execution.
+    /// This is set by either `initialize_dsm_custom_scan` (in the leader) or
+    /// `initialize_worker_custom_scan` (in a worker), and then consumed in
+    /// `exec_custom_scan` to initialize the DataFusion execution plan.
+    pub parallel_state: Option<*mut ParallelScanState>,
 }
 
 impl JoinScanState {
@@ -166,8 +192,10 @@ fn build_clause_df<'a>(
             ));
         }
 
+        let partitioning_idx = join_clause.partitioning_source_index();
+
         // 1. Start with the first source
-        let mut df = build_source_df(ctx, &join_clause.sources[0]).await?;
+        let mut df = build_source_df(ctx, &join_clause.sources[0], partitioning_idx == 0).await?;
         let alias0 = join_clause.sources[0].execution_alias(0);
         df = df.alias(&alias0)?;
 
@@ -180,7 +208,7 @@ fn build_clause_df<'a>(
         // 2. Iteratively join subsequent sources
         for i in 1..join_clause.sources.len() {
             let right_source = &join_clause.sources[i];
-            let right_df = build_source_df(ctx, right_source).await?;
+            let right_df = build_source_df(ctx, right_source, partitioning_idx == i).await?;
             let alias_right = right_source.execution_alias(i);
             let right_df = right_df.alias(&alias_right)?;
 
@@ -291,13 +319,6 @@ fn build_clause_df<'a>(
                 }
             }
 
-            // Execute join-level predicates to get matching sets
-            let mut join_level_sets = Vec::with_capacity(join_clause.join_level_predicates.len());
-            for pred in &join_clause.join_level_predicates {
-                let set = unsafe { compute_predicate_matches(pred)? };
-                join_level_sets.push(Arc::new(set));
-            }
-
             // Create a map of RTI -> CTID column expression for join-level predicates
             let mut ctid_map = crate::api::HashMap::default();
             for (i, source) in join_clause.sources.iter().enumerate() {
@@ -315,11 +336,13 @@ fn build_clause_df<'a>(
                 }
             }
 
+            // Translate join-level expression to DataFusion filter.
+            // Single-table predicates use SearchPredicateUDF which can be pushed down
+            // to PgSearchTableProvider via DataFusion's filter pushdown mechanism.
             let filter_expr = unsafe {
                 crate::postgres::customscan::joinscan::translator::PredicateTranslator::translate_join_level_expr(
                     join_level_expr,
                     &translated_exprs,
-                    &join_level_sets,
                     &ctid_map,
                     &join_clause.join_level_predicates,
                 )
@@ -469,6 +492,7 @@ fn build_projection_expr(
 fn build_source_df<'a>(
     ctx: &'a SessionContext,
     source: &'a JoinSource,
+    is_parallel: bool,
 ) -> LocalBoxFuture<'a, Result<DataFrame>> {
     async move {
         let scan_info = &source.scan_info;
@@ -478,6 +502,8 @@ fn build_source_df<'a>(
         let provider = Arc::new(PgSearchTableProvider::new(
             scan_info.clone(),
             fields.clone(),
+            None,
+            is_parallel,
         ));
         ctx.register_table(alias, provider)?;
 
@@ -501,42 +527,4 @@ fn build_source_df<'a>(
         Ok(df)
     }
     .boxed_local()
-}
-/// Execute a join-level search predicate (Tantivy query) and return the matching CTIDs.
-unsafe fn compute_predicate_matches(pred: &JoinLevelSearchPredicate) -> Result<Vec<u64>> {
-    let index_rel = PgSearchRelation::open(pred.indexrelid);
-    let heap_rel = PgSearchRelation::open(pred.heaprelid);
-
-    let reader = SearchIndexReader::open_with_context(
-        &index_rel,
-        pred.query.clone(),
-        false,
-        MvccSatisfies::Snapshot,
-        None,
-        None,
-    )
-    .map_err(|e| DataFusionError::Internal(format!("Failed to open reader: {e}")))?;
-
-    let search_results = reader.search();
-    let fields = vec![WhichFastField::Ctid];
-    let ffhelper = FFHelper::with_fields(&reader, &fields);
-    let snapshot = pg_sys::GetActiveSnapshot();
-    let mut visibility = HeapVisibilityChecker::with_rel_and_snap(&heap_rel, snapshot);
-
-    let mut scanner = Scanner::new(search_results, None, fields, pred.heaprelid.into());
-
-    let mut ctids = Vec::new();
-    while let Some(batch) = scanner.next(&ffhelper, &mut visibility) {
-        if let Some(Some(col)) = batch.fields.first() {
-            let array = col
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("Ctid should be UInt64Array");
-            ctids.extend(array.values());
-        }
-    }
-
-    ctids.sort_unstable();
-    ctids.dedup();
-    Ok(ctids)
 }

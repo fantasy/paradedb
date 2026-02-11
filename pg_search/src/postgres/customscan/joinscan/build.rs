@@ -24,11 +24,13 @@
 //! time. See `extract_score_pathkey()` in mod.rs.
 
 use crate::api::OrderByInfo;
+use crate::postgres::utils::ExprContextGuard;
 use crate::query::SearchQueryInput;
 pub use crate::scan::ScanInfo;
 use pgrx::pg_sys;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::ptr::NonNull;
 
 /// Represents the join type for serialization.
 ///
@@ -103,6 +105,9 @@ pub struct JoinLevelSearchPredicate {
     pub heaprelid: pg_sys::Oid,
     /// The search query.
     pub query: SearchQueryInput,
+    /// Human-readable representation of the original PostgreSQL expression (for EXPLAIN output).
+    /// Eagerly computed during planning via `deparse_expr`.
+    pub display_string: String,
 }
 
 /// Projection information for a child join.
@@ -115,6 +120,11 @@ pub struct ChildProjection {
     pub is_score: bool,
 }
 
+use crate::index::mvcc::MvccSatisfies;
+use crate::index::reader::index::SearchIndexReader;
+use crate::postgres::rel::PgSearchRelation;
+use crate::scan::info::RowEstimate;
+
 /// Represents the source of data for a join side.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JoinSource {
@@ -124,6 +134,48 @@ pub struct JoinSource {
 impl JoinSource {
     pub fn new(scan_info: ScanInfo) -> Self {
         Self { scan_info }
+    }
+
+    /// Calculate and store the estimated number of rows matching the query.
+    ///
+    /// This uses `MvccSatisfies::LargestSegment` to efficiently estimate the count
+    /// without opening all segments.
+    ///
+    /// If the source does not have a BM25 index, this is a no-op.
+    /// If estimation fails (e.g. IO error), this method will panic.
+    pub fn estimate_rows(&mut self) {
+        if !self.has_bm25_index() {
+            return;
+        }
+
+        let indexrelid = self.scan_info.indexrelid.expect("Index relid missing");
+        let heaprelid = self.scan_info.heaprelid.expect("Heap relid missing");
+
+        let index_rel = PgSearchRelation::open(indexrelid);
+        let heap_rel = PgSearchRelation::open(heaprelid);
+
+        // `expr_context` only lives until the end of this function,
+        // which is fine because it is only used to get estimates
+        let expr_context = ExprContextGuard::new();
+        let reader = SearchIndexReader::open_with_context(
+            &index_rel,
+            self.scan_info
+                .query
+                .clone()
+                .unwrap_or(crate::query::SearchQueryInput::All),
+            false,
+            MvccSatisfies::LargestSegment,
+            NonNull::new(expr_context.as_ptr()),
+            None,
+        )
+        .expect("Failed to open index reader for estimation");
+
+        self.scan_info.segment_count = Some(reader.total_segment_count());
+
+        let row_estimate = RowEstimate::from_reltuples(heap_rel.reltuples().map(|r| r as f64));
+
+        let (estimate, _) = reader.estimate_docs(row_estimate);
+        self.scan_info.estimate = Some(RowEstimate::Known(estimate as u64));
     }
 
     pub fn alias(&self) -> Option<String> {
@@ -292,6 +344,7 @@ impl JoinCSClause {
         indexrelid: pg_sys::Oid,
         heaprelid: pg_sys::Oid,
         query: SearchQueryInput,
+        display_string: String,
     ) -> usize {
         let idx = self.join_level_predicates.len();
         self.join_level_predicates.push(JoinLevelSearchPredicate {
@@ -299,6 +352,7 @@ impl JoinCSClause {
             indexrelid,
             heaprelid,
             query,
+            display_string,
         });
         idx
     }
@@ -360,6 +414,22 @@ impl JoinCSClause {
     /// Get the ordering side source (side with search predicate).
     pub fn ordering_side(&self) -> Option<&JoinSource> {
         self.ordering_side_index().map(|i| &self.sources[i])
+    }
+
+    /// Returns the source that should be partitioned for parallel execution.
+    /// This is the source with the largest row estimate.
+    pub fn partitioning_source(&self) -> &JoinSource {
+        &self.sources[self.partitioning_source_index()]
+    }
+
+    /// Returns the index of the source that should be partitioned for parallel execution.
+    pub fn partitioning_source_index(&self) -> usize {
+        self.sources
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.scan_info.estimate.cmp(&b.scan_info.estimate))
+            .map(|(i, _)| i)
+            .expect("JoinScan requires at least one source")
     }
 
     /// Recursively collect all base relations in this join tree.
